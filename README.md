@@ -49,6 +49,197 @@ Full documentation can be found [here](https://huggingface.co/docs/smolagents/in
 > [!NOTE]
 > Check the our [launch blog post](https://huggingface.co/blog/smolagents) to learn more about `smolagents`!
 
+## 🌲 扩展功能：树形多智能体 Rollout
+
+本 fork 扩展了 smolagents，实现了树形多智能体推理系统，支持推理时的自一致性（Self-Consistency）和训练时的轨迹采样。
+
+### 核心特性
+
+**1. 三种分支模式**
+- **Agent-level branching**: 起始点创建多个独立推理路径
+- **Step-level branching**: 每步探索多个后续动作
+- **层次化 Sub-agents**: 子智能体各自进行树形探索
+
+**2. 应用场景**
+
+**推理：Self-Consistency 提升准确率**
+```python
+from smolagents import BranchingCodeAgent, BranchConfig
+
+agent = BranchingCodeAgent(
+    tools=[...],
+    model=model,
+    branch_config=BranchConfig(mode='agent_level', n_branches=3),
+    max_steps=5
+)
+# 生成 3 条独立推理路径 → 投票选择最优答案
+```
+
+**训练：轨迹采样提升样本多样性**
+```python
+agent = BranchingCodeAgent(
+    tools=[...],
+    model=model,
+    branch_config=BranchConfig(mode='step_level', n_branches=3, branch_at_steps=2)
+)
+# 单个 prompt 生成 3^3 = 27 条不同轨迹，适用于 PPO/GRPO 训练
+```
+
+**多智能体协作**
+```python
+math_agent = BranchingCodeAgent(
+    tools=[sympy_tools],
+    branch_config=BranchConfig(mode='agent_level', n_branches=2)
+)
+
+main_agent = BranchingCodeAgent(
+    managed_agents=[math_agent],
+    branch_config=BranchConfig(mode='agent_level', n_branches=2)
+)
+# 嵌套树形结构：2 个主分支 × 2 个 math 结果 = 4 条完整路径
+```
+
+
+### 技术特点
+
+- 完全异步并行执行（`anyio.create_task_group`）
+- 内存高效（分支共享模型和工具）
+- 完整的树形结构可视化（JSON + ASCII）
+- 每分支独立 max_steps 控制
+
+### 实现代码
+
+实现位于 [`examples/agent_tree/`](./examples/agent_tree/)，包括：
+- `simple_tree_demo.py` - 基础用法
+- `async_math_solving_example.py` - 多智能体协作
+- `tree_rollout_with_tracking.py` - 树形可视化
+
+核心组件（~1200 行）：
+- `BranchingCodeAgent`: 支持内存克隆的智能体
+- `TreeRollout`: 异步编排器
+- `CodeAgentTreeMemory`: 树形结构存储
+
+---
+
+### 生成的结构（部分）
+CodeAgent Tree:
+└── Depth 0 [main_agent] TaskStep: "使用 math_agent 来解决以下问题:已知椭圆G: x²/2 + y² =..."
+    ├── Depth 1 [main_agent] ActionStep [SUB-AGENT PENDING]
+    │   ↳ Sub-agent tree:
+    │     └── Depth 0 [math_agent] TaskStep: "task1"
+    │         ├── Depth 1 [math_agent] ActionStep
+    │         │   └── Depth 2 [math_agent] ActionStep [FINAL: 42]
+    │         └── Depth 1 [math_agent] ActionStep
+    │             └── Depth 2 [math_agent] ActionStep [ERROR]
+    │                 └── Depth 3 [math_agent] ActionStep [FINAL: Task1 received. Please provide...]
+    │   ├── Depth 2 [main_agent] ActionStep [SUB-AGENT PENDING]
+    │   │   ↳ Sub-agent tree:
+    │   │     └── Depth 0 [math_agent] TaskStep: "task1_detailed"
+    │   │         ├── Depth 1 [math_agent] ActionStep
+    │   │         │   └── Depth 2 [math_agent] ActionStep
+    │   │         │       └── Depth 3 [math_agent] ActionStep [FINAL: {'primary_task': 'task1', 'var...]
+    │   │         └── Depth 1 [math_agent] ActionStep
+    │   │             └── Depth 2 [math_agent] ActionStep
+    │   │                 └── Depth 3 [math_agent] ActionStep [FINAL: {'input_analysis': "Found a se...]
+    │   │   ├── Depth 3 [main_agent] ActionStep [SUB-AGENT PENDING]
+    │   │   │   ↳ Sub-agent tree:
+    │   │   │     └── Depth 0 [math_agent] TaskStep: "task1_calc"
+    │   │   │         ├── Depth 1 [math_agent] ActionStep [ERROR]
+    │   │   │         │   └── Depth 2 [math_agent] ActionStep
+    │   │   │         │       └── Depth 3 [math_agent] ActionStep
+    │   │   │         │           └── Depth 4 [math_agent] ActionStep
+    │   │   │         │               └── Depth 5 [math_agent] ActionStep [FINAL: I'm ready to solve 'task1_calc...]
+    │   │   │         └── Depth 1 [math_agent] ActionStep
+    │   │   │             └── Depth 2 [math_agent] ActionStep [ERROR]
+    │   │   │                 └── Depth 3 [math_agent] ActionStep
+    │   │   │                     └── Depth 4 [math_agent] ActionStep
+    │   │   │                         └── Depth 5 [math_agent] ActionStep [FINAL: I've demonstrated a calculatio...]
+    │   │   │   ├── Depth 4 [main_agent] ActionStep [SUB-AGENT PENDING]
+    │   │   │   │   ↳ Sub-agent tree:
+    │   │   │   │     └── Depth 0 [math_agent] TaskStep: "task1_specific"
+    │   │   │   │         ├── Depth 1 [math_agent] ActionStep [ERROR]
+    │   │   │   │         │   └── Depth 2 [math_agent] ActionStep [ERROR]
+    │   │   │   │         │       └── Depth 3 [math_agent] ActionStep [FINAL: No specific task instructions ...]
+    │   │   │   │         └── Depth 1 [math_agent] ActionStep
+    │   │   │   │             └── Depth 2 [math_agent] ActionStep [FINAL: No task description provided. ...]
+    │   │   │   │   ├── Depth 5 [main_agent] ActionStep [FINAL: 看来 math_agent 在处理这个解析几何问题时遇到了困...]
+    │   │   │   │   └── Depth 5 [main_agent] ActionStep [FINAL: 我将直接解决这个椭圆几何问题，而不依赖 math_agent...]
+    │   │   │   └── Depth 4 [main_agent] ActionStep [SUB-AGENT PENDING]
+    │   │   │       ↳ Sub-agent tree:
+    │   │   │         └── Depth 0 [math_agent] TaskStep: "task1_explicit"
+    │   │   │             ├── Depth 1 [math_agent] ActionStep
+    │   │   │             │   └── Depth 2 [math_agent] ActionStep
+    │   │   │             │       └── Depth 3 [math_agent] ActionStep
+    │   │   │             │           └── Depth 4 [math_agent] ActionStep [FINAL: 406]
+    │   │   │             └── Depth 1 [math_agent] ActionStep
+    │   │   │                 └── Depth 2 [math_agent] ActionStep
+    │   │   │                     └── Depth 3 [math_agent] ActionStep [FINAL: {'total_tasks': 20, 'unique_ta...]
+    │   │   │       ├── Depth 5 [main_agent] ActionStep [FINAL: 我将直接解决这个椭圆几何问题。
+已知信息：
+- 椭圆...]
+    │   │   │       └── Depth 5 [main_agent] ActionStep [FINAL: 我将直接解决这个椭圆几何问题，而不依赖 math_agent...]
+    │   │   └── Depth 3 [main_agent] ActionStep [SUB-AGENT PENDING]
+    │   │       ↳ Sub-agent tree:
+    │   │         └── Depth 0 [math_agent] TaskStep: "task1_math"
+    │   │             ├── Depth 1 [math_agent] ActionStep [ERROR]
+    │   │             │   └── Depth 2 [math_agent] ActionStep
+    │   │             │       └── Depth 3 [math_agent] ActionStep
+    │   │             │           └── Depth 4 [math_agent] ActionStep
+    │   │             │               └── Depth 5 [math_agent] ActionStep [FINAL: 11.4]
+    │   │             └── Depth 1 [math_agent] ActionStep
+    │   │                 └── Depth 2 [math_agent] ActionStep
+    │   │                     └── Depth 3 [math_agent] ActionStep [FINAL: {'total_tasks': 10, 'unique_va...]
+    │   │       ├── Depth 4 [main_agent] ActionStep [SUB-AGENT PENDING]
+    │   │       │   ↳ Sub-agent tree:
+    │   │       │     └── Depth 0 [math_agent] TaskStep: "task_calculation"
+    │   │       │         ├── Depth 1 [math_agent] ActionStep [ERROR]
+    │   │       │         │   └── Depth 2 [math_agent] ActionStep
+    │   │       │         │       └── Depth 3 [math_agent] ActionStep
+    │   │       │         │           └── Depth 4 [math_agent] ActionStep [FINAL: {'total_tasks': 17, 'unique_ta...]
+    │   │       │         └── Depth 1 [math_agent] ActionStep
+    │   │       │             └── Depth 2 [math_agent] ActionStep
+    │   │       │                 └── Depth 3 [math_agent] ActionStep
+    │   │       │                     └── Depth 4 [math_agent] ActionStep [FINAL: No specific calculation provid...]
+    │   │       │   ├── Depth 5 [main_agent] ActionStep [FINAL: 看来 math_agent 在处理这类解析几何问题时遇到了困...]
+    │   │       │   └── Depth 5 [main_agent] ActionStep [FINAL: 我将直接为您解答这个椭圆几何问题，而不依赖 math_age...]
+    │   │       └── Depth 4 [main_agent] ActionStep
+    │   │           └── Depth 5 [main_agent] ActionStep [FINAL: 根据计算，我来回答这个问题：
+第(1)部分解答
+当直...]
+    │   └── Depth 2 [main_agent] ActionStep [SUB-AGENT PENDING]
+    │       ↳ Sub-agent tree:
+    │         └── Depth 0 [math_agent] TaskStep: "task1_detailed"
+    │             ├── Depth 1 [math_agent] ActionStep
+    │             │   └── Depth 2 [math_agent] ActionStep
+    │             │       └── Depth 3 [math_agent] ActionStep
+    │             │           └── Depth 4 [math_agent] ActionStep [FINAL: I cannot solve the task becaus...]
+    │             └── Depth 1 [math_agent] ActionStep [ERROR]
+    │                 └── Depth 2 [math_agent] ActionStep [ERROR]
+    │                     └── Depth 3 [math_agent] ActionStep [FINAL: The task description appears t...]
+    │       ├── Depth 3 [main_agent] ActionStep [SUB-AGENT PENDING]
+    │       │   ↳ Sub-agent tree:
+    │       │     └── Depth 0 [math_agent] TaskStep: "task1_clear"
+    │       │         ├── Depth 1 [math_agent] ActionStep [FINAL: Task variations received. Plea...]
+    │       │         └── Depth 1 [math_agent] ActionStep
+    │       │             └── Depth 2 [math_agent] ActionStep [FINAL: I'm ready to help! However, th...]
+    │       │   ├── Depth 4 [main_agent] ActionStep
+    │       │   │   └── Depth 5 [main_agent] ActionStep [FINAL: 根据计算，我来回答这个问题：
+(1) 当直线l的斜率...]
+    │       │   └── Depth 4 [main_agent] ActionStep [SUB-AGENT PENDING]
+    │       │       ↳ Sub-agent tree:
+    │       │         └── Depth 0 [math_agent] TaskStep: "task2"
+    │       │             ├── Depth 1 [math_agent] ActionStep [ERROR]
+    │       │             │   └── Depth 2 [math_agent] ActionStep
+    │       │             │       └── Depth 3 [math_agent] ActionStep
+    │       │             │           └── Depth 4 [math_agent] ActionStep [FINAL: The task sequence shows a work...]
+    │       │             └── Depth 1 [math_agent] ActionStep
+    │       │                 └── Depth 2 [math_agent] ActionStep
+    │       │                     └── Depth 3 [math_agent] ActionStep [FINAL: I'm ready to help solve task2,...]
+    │       │       ├── Depth 5 [main_agent] ActionStep [FINAL: 我将直接为您解答这个问题，因为 math_agent 似乎无...]
+    │       │       └── Depth 5 [main_agent] ActionStep [FINAL: 我将直接为您解答这个问题，因为 math_agent 似乎无...]
+    │       └── Depth 3 [main_agent] ActionStep [SUB-AGENT PENDING]
+
+
 ## Quick demo
 
 First install the package with a default set of tools:
