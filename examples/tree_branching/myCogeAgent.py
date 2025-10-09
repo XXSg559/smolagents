@@ -327,6 +327,16 @@ class BranchingCodeAgent(CodeAgent):
             def __init__(self, managed_agent_names):
                 self.managed_agent_names = managed_agent_names
                 self.calls = []
+                self.assignments = {}  # 记录变量赋值
+
+            def visit_Assign(self, node):
+                # 收集变量赋值（只支持简单的赋值）
+                for target in node.targets:
+                    if isinstance(target, ast.Name):
+                        # 只提取字符串字面量
+                        if isinstance(node.value, ast.Constant):
+                            self.assignments[target.id] = node.value.value
+                self.generic_visit(node)
 
             def visit_Call(self, node):
                 # 检查是否是直接调用 managed_agent
@@ -341,6 +351,15 @@ class BranchingCodeAgent(CodeAgent):
                             # 简单情况：如果是字符串字面量
                             if isinstance(node.args[0], ast.Constant):
                                 args_dict['task'] = node.args[0].value
+                            # 如果是变量名，尝试从 assignments 中查找
+                            elif isinstance(node.args[0], ast.Name):
+                                var_name = node.args[0].id
+                                if var_name in self.assignments:
+                                    args_dict['task'] = self.assignments[var_name]
+                                    print(f"[DEBUG] Resolved variable '{var_name}' to its assigned value")
+                                else:
+                                    # 找不到赋值，记录变量名
+                                    args_dict['task'] = var_name
                             else:
                                 # 复杂表达式，记录为字符串
                                 args_dict['task'] = ast.unparse(node.args[0])
@@ -350,6 +369,13 @@ class BranchingCodeAgent(CodeAgent):
                             if keyword.arg == 'task':
                                 if isinstance(keyword.value, ast.Constant):
                                     args_dict['task'] = keyword.value.value
+                                elif isinstance(keyword.value, ast.Name):
+                                    var_name = keyword.value.id
+                                    if var_name in self.assignments:
+                                        args_dict['task'] = self.assignments[var_name]
+                                        print(f"[DEBUG] Resolved variable '{var_name}' to its assigned value")
+                                    else:
+                                        args_dict['task'] = var_name
                                 else:
                                     args_dict['task'] = ast.unparse(keyword.value)
 
@@ -653,11 +679,15 @@ class TreeRollout:
                     # 重要：明确告诉 LLM 结果已返回，不需要再次调用
                     new_branch.memory.steps[-1].observations = (
                         f"Execution logs:\n"
-                        f"Sub-agent '{sub_agent_name}' completed successfully.\n"
-                        f"\nLast output from code snippet:\n{sub_result}"
+                        f"{sub_result}"
                     )
                     new_branch.memory.steps[-1].action_output = sub_result
                     new_branch.memory.steps[-1].is_final_answer = False  # 不是最终答案，需要继续处理
+
+                    # Debug: 验证 memory 是否被正确修改
+                    print(f"[DEBUG] Updated last step observation to: {new_branch.memory.steps[-1].observations[:]}...")
+                    print(f"[DEBUG] Total steps in new_branch: {len(new_branch.memory.steps)}")
+
                     # 继续线性执行（agent-level 不再分支）
                     await self._execute_no_branch(new_branch, new_node)
 
@@ -1012,7 +1042,7 @@ if __name__ == "__main__":
         managed_agents=[math_agent],
         # additional_authorized_imports=['sympy', 'math', 'numpy'],
         max_steps=3,
-        branch_config=BranchConfig(mode='agent_level', n_branches=2),
+        branch_config=BranchConfig(mode='agent_level', n_branches=1),
         verbosity_level=1  # 增加 verbosity 来帮助 debugging
     )
 
